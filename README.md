@@ -56,6 +56,8 @@ sudo ./meca_mem_hotplug_test
 
 ## Display
 
+![MECA Memory Hotplug Test Screenshot](./meca_mem_hotplug_test_capture.png)
+
 The utility displays three memory bars:
 
 1. **Total Memory** - Combined DMA32 + Movable zones
