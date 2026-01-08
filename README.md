@@ -58,7 +58,7 @@ sudo ./meca_mem_hotplug_test
 
 ![MECA Memory Hotplug Test Screenshot](./meca_mem_hotplug_test_capture.png)
 
-The utility displays three memory bars:
+The utility displays four memory bars:
 
 1. **Total Memory** - Combined DMA32 + Movable zones
 2. **Local Memory** - DMA32 zone (system memory)
@@ -66,7 +66,7 @@ The utility displays three memory bars:
 3. **User Allocated Memory** - Allocated Memory
 
 Each bar shows:
-- Red: Used memory
+- Red: Used(Allocated) memory
 - Yellow: Cached memory
 - Green/Cyan: Free memory
 
@@ -77,7 +77,7 @@ Each bar shows:
 | MECA Base Address | 0x200000000 (8GB) |
 | MECA Max Size | 8GB |
 | Memory Block Size | 128MB (system dependent) |
-| Allocation Size | 100MB per block |
+| User Allocation Size | 100MB per block |
 
 ## Requirements
 
