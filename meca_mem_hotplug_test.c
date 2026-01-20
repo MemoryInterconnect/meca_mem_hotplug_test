@@ -7,6 +7,7 @@
 #include <termios.h>
 #include <dirent.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 
 #define DEFAULT_ZONEINFO_PATH "/proc/zoneinfo"
 #define PAGE_SIZE 4096
@@ -15,8 +16,9 @@
 #define MEMORY_BLOCK_SIZE_PATH "/sys/devices/system/memory/block_size_bytes"
 #define MEMORY_BASE_ADDR 0x200000000UL
 #define MEMORY_MAX_SIZE (8UL * 1024 * 1024 * 1024)
-#define ALLOC_SIZE (100 * 1024 * 1024)
+#define ALLOC_SIZE (20 * 1024 * 1024)
 #define MAX_ALLOCS 1024
+#define FREE_MEMORY_LIMIT_PERCENT 10
 
 typedef struct {
     long managed;
@@ -41,6 +43,7 @@ static int num_memory_blocks = 0;
 static void *allocated_blocks[MAX_ALLOCS];
 static int num_allocs = 0;
 static char status_msg[256] = "";
+static volatile bool stop_allocation = false;
 
 static void restore_terminal(void)
 {
@@ -61,6 +64,42 @@ static void set_raw_mode(void)
     raw.c_lflag &= ~(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
     terminal_raw = true;
+}
+
+static bool get_meminfo(long *total_kb, long *free_kb)
+{
+    FILE *fp;
+    char line[256];
+    bool got_total = false, got_free = false;
+
+    fp = fopen("/proc/meminfo", "r");
+    if (!fp)
+        return false;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "MemTotal:", 9) == 0) {
+            sscanf(line, "MemTotal: %ld", total_kb);
+            got_total = true;
+        } else if (strncmp(line, "MemAvailable:", 13) == 0) {
+            sscanf(line, "MemAvailable: %ld", free_kb);
+            got_free = true;
+        }
+        if (got_total && got_free)
+            break;
+    }
+
+    fclose(fp);
+    return got_total && got_free;
+}
+
+static bool check_key_available(void)
+{
+    fd_set fds;
+    struct timeval tv = {0, 0};
+
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
 }
 
 static unsigned long get_block_size(void)
@@ -146,7 +185,7 @@ static bool add_memory(void)
     unsigned long block_size;
     unsigned long addr;
 
-    printf("Status: Adding memory...\n");
+    printf("Status: Adding MECA memory 128 MB ...\n");
     fflush(stdout);
 
     if (num_memory_blocks >= MAX_ALLOCS) {
@@ -210,7 +249,7 @@ static bool remove_memory(void)
     char state_path[128];
     int block_num;
 
-    printf("Status: Removing memory...\n");
+    printf("Status: Removing MECA Memory 128 MB ...\n");
     fflush(stdout);
 
     if (num_memory_blocks <= 0) {
@@ -239,47 +278,88 @@ static bool remove_memory(void)
     return true;
 }
 
-static void allocate_memory(void)
+static bool allocate_memory_once(bool ignore_limit)
 {
     void *mem;
+    long total_kb, free_kb;
+    long limit_kb;
 
     if (num_allocs >= MAX_ALLOCS) {
         snprintf(status_msg, sizeof(status_msg),
                  "Max allocations reached (%d)", MAX_ALLOCS);
-        return;
+        return false;
     }
 
-    printf("Status: Allocating 100 MB...\n");
-    fflush(stdout);
+    /* Check free memory limit (unless ignoring) */
+    if (!ignore_limit && get_meminfo(&total_kb, &free_kb)) {
+        limit_kb = total_kb * FREE_MEMORY_LIMIT_PERCENT / 100;
+        if (free_kb <= limit_kb) {
+            snprintf(status_msg, sizeof(status_msg),
+                     "Free memory limit reached (%ld MB free, limit %ld MB)",
+                     free_kb / 1024, limit_kb / 1024);
+            return false;
+        }
+    }
 
     mem = malloc(ALLOC_SIZE);
     if (!mem) {
         snprintf(status_msg, sizeof(status_msg),
-                 "Failed to allocate 100 MB");
-        return;
+                 "Failed to allocate 20 MB");
+        return false;
     }
 
     int i;
-    char * a = mem;
-    for (i=0; i<ALLOC_SIZE; i+=PAGE_SIZE) {
+    char *a = mem;
+    for (i = 0; i < ALLOC_SIZE; i += PAGE_SIZE) {
         a[i] = '\0';
     }
-#if 0
-    /* Use mlock to verify memory is actually available */
-    if (mlock(mem, ALLOC_SIZE) != 0) {
-        free(mem);
-        snprintf(status_msg, sizeof(status_msg),
-                 "Not enough memory available for 100 MB");
-        return;
-    }
 
-    /* Unlock but keep the memory allocated */
-    munlock(mem, ALLOC_SIZE);
-#endif
     allocated_blocks[num_allocs++] = mem;
     snprintf(status_msg, sizeof(status_msg),
              "Allocated total %d MB",
-             num_allocs * 100);
+             num_allocs * 20);
+    return true;
+}
+
+static void refresh_display(const char *zoneinfo_path);
+
+static void continuous_allocate(const char *zoneinfo_path)
+{
+    int ch;
+    bool ignore_limit = false;
+    long total_kb, free_kb, limit_kb;
+
+    stop_allocation = false;
+
+    /* If already below limit, user wants to ignore the limit */
+    if (get_meminfo(&total_kb, &free_kb)) {
+        limit_kb = total_kb * FREE_MEMORY_LIMIT_PERCENT / 100;
+        if (free_kb <= limit_kb) {
+            ignore_limit = true;
+        }
+    }
+
+    while (!stop_allocation) {
+        if (!allocate_memory_once(ignore_limit)) {
+            break;
+        }
+
+        refresh_display(zoneinfo_path);
+
+        /* Check for 'p' key press */
+        if (check_key_available()) {
+            ch = getchar();
+            if (ch == 'p' || ch == 'P') {
+                stop_allocation = true;
+                snprintf(status_msg, sizeof(status_msg),
+                         "Allocation stopped by user (total: %d MB)",
+                         num_allocs * 20);
+                break;
+            }
+        }
+
+//        usleep(100000); /* 100ms delay between allocations */
+    }
 }
 
 static void free_memory(void)
@@ -294,8 +374,8 @@ static void free_memory(void)
     allocated_blocks[num_allocs] = NULL;
 
     snprintf(status_msg, sizeof(status_msg),
-             "Freed 100 MB (remaining: %d blocks, %d MB)",
-             num_allocs, num_allocs * 100);
+             "Freed 20 MB (remaining: %d blocks, %d MB)",
+             num_allocs, num_allocs * 20);
 }
 
 static void parse_zone(FILE *fp, ZoneInfo *zone)
@@ -428,6 +508,82 @@ static void draw_bar(const char *label, const MemoryStats *stats, int width,
            used_str, cached_str, free_color, free_str);
 }
 
+static void refresh_display(const char *zoneinfo_path)
+{
+    FILE *fp;
+    ZoneInfo dma32_zone, movable_zone;
+    MemoryStats dma32_stats, movable_stats;
+    bool has_dma32 = false, has_movable = false;
+    int i, bar_blocks;
+
+    fp = fopen(zoneinfo_path, "r");
+    if (!fp)
+        return;
+
+    if (find_zone(fp, "DMA32")) {
+        parse_zone(fp, &dma32_zone);
+        dma32_stats = calculate_stats(&dma32_zone);
+        has_dma32 = true;
+    }
+
+    if (find_zone(fp, "Movable")) {
+        parse_zone(fp, &movable_zone);
+        movable_stats = calculate_stats(&movable_zone);
+        has_movable = (movable_zone.managed > 0);
+    }
+
+    fclose(fp);
+
+    /* Clear screen and move cursor to top-left */
+    printf("\033[2J\033[H");
+
+    printf("\n=== Memory Usage Information ===\n\n");
+
+    if (has_dma32) {
+        MemoryStats total_stats;
+        total_stats.total = dma32_stats.total;
+        total_stats.used = dma32_stats.used;
+        total_stats.cached = dma32_stats.cached;
+        total_stats.free = dma32_stats.free;
+        if (has_movable) {
+            total_stats.total += movable_stats.total;
+            total_stats.used += movable_stats.used;
+            total_stats.cached += movable_stats.cached;
+            total_stats.free += movable_stats.free;
+        }
+        draw_bar("Total Memory", &total_stats, BAR_WIDTH, "42");
+    }
+
+    if (has_dma32) {
+        draw_bar("Local Memory", &dma32_stats, BAR_WIDTH, "42");
+    } else {
+        printf("DMA32 Zone not found.\n\n");
+    }
+
+    if (has_movable) {
+        draw_bar("MECA Memory", &movable_stats, BAR_WIDTH, "46");
+    }
+
+    /* Display allocated memory blocks (1 block = 100MB) */
+    bar_blocks = (num_allocs * 20) / 100;  /* 20MB per alloc, 100MB per block */
+    printf("User Allocated Memory [%d MB]\n", num_allocs * 20);
+    printf("[");
+    for (i = 0; i < bar_blocks && i < BAR_WIDTH; i++)
+        printf("\033[41m \033[0m");
+    for (i = bar_blocks; i < BAR_WIDTH; i++)
+        printf(" ");
+    printf("]\n\n");
+
+    printf("---\n");
+    printf("Commands: [q]uit  [a]hotplug MECA  [r]emove MECA  [s]tart alloc (p=stop)  [d]ealloc\n");
+
+    if (status_msg[0]) {
+        printf("Status: %s\n", status_msg);
+    }
+
+    fflush(stdout);
+}
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [zoneinfo_path]\n", prog);
@@ -437,12 +593,8 @@ static void print_usage(const char *prog)
 
 int main(int argc, char *argv[])
 {
-    FILE *fp;
-    ZoneInfo dma32_zone, movable_zone;
-    MemoryStats dma32_stats, movable_stats;
-    bool has_dma32, has_movable;
     const char *zoneinfo_path = DEFAULT_ZONEINFO_PATH;
-    int ch, i;
+    int ch;
 
     if (argc > 2) {
         print_usage(argv[0]);
@@ -463,80 +615,7 @@ int main(int argc, char *argv[])
     scan_existing_memory_blocks();
 
     while (1) {
-        has_dma32 = false;
-        has_movable = false;
-
-        fp = fopen(zoneinfo_path, "r");
-        if (!fp) {
-            restore_terminal();
-            perror(zoneinfo_path);
-            return 1;
-        }
-
-        /* Find and parse DMA32 zone (always show) */
-        if (find_zone(fp, "DMA32")) {
-            parse_zone(fp, &dma32_zone);
-            dma32_stats = calculate_stats(&dma32_zone);
-            has_dma32 = true;
-        }
-
-        /* Find and parse Movable zone (show only if free > 0) */
-        if (find_zone(fp, "Movable")) {
-            parse_zone(fp, &movable_zone);
-            movable_stats = calculate_stats(&movable_zone);
-            has_movable = (movable_zone.managed > 0);
-        }
-
-        fclose(fp);
-
-        /* Clear screen and move cursor to top-left */
-        printf("\033[2J\033[H");
-
-        printf("\n=== Memory Usage Information ===\n\n");
-
-        /* Total Memory = DMA32 + Movable */
-        if (has_dma32) {
-            MemoryStats total_stats;
-            total_stats.total = dma32_stats.total;
-            total_stats.used = dma32_stats.used;
-            total_stats.cached = dma32_stats.cached;
-            total_stats.free = dma32_stats.free;
-            if (has_movable) {
-                total_stats.total += movable_stats.total;
-                total_stats.used += movable_stats.used;
-                total_stats.cached += movable_stats.cached;
-                total_stats.free += movable_stats.free;
-            }
-            draw_bar("Total Memory", &total_stats, BAR_WIDTH, "42");
-        }
-
-        if (has_dma32) {
-            draw_bar("Local Memory", &dma32_stats, BAR_WIDTH, "42");
-        } else {
-            printf("DMA32 Zone not found.\n\n");
-        }
-
-        if (has_movable) {
-            draw_bar("MECA Memory", &movable_stats, BAR_WIDTH, "46");
-        }
-
-        /* Display allocated memory blocks */
-        printf("User Allocated Memory [%d MB]\n", num_allocs * 100);
-        printf("[");
-        for (i = 0; i < num_allocs; i++)
-            printf("\033[41m \033[0m");
-        for (i = num_allocs; i < BAR_WIDTH; i++)
-            printf(" ");
-        printf("]\n\n");
-
-        printf("---\n");
-        printf("Commands: [q]uit  [a]hotplug MECA  [r]emove MECA  [s]alloc 100MB  [d]ealloc\n");
-
-        if (status_msg[0]) {
-            printf("Status: %s\n", status_msg);
-        }
-
-        fflush(stdout);
+        refresh_display(zoneinfo_path);
 
         /* Flush any input that was typed during display update */
         tcflush(STDIN_FILENO, TCIFLUSH);
@@ -550,7 +629,7 @@ int main(int argc, char *argv[])
         else if (ch == 'r' || ch == 'R')
             remove_memory();
         else if (ch == 's' || ch == 'S')
-            allocate_memory();
+            continuous_allocate(zoneinfo_path);
         else if (ch == 'd' || ch == 'D')
             free_memory();
     }

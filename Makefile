@@ -11,6 +11,7 @@ SRC = meca_mem_hotplug_test.c
 all: $(TARGET)
 
 $(TARGET): $(SRC)
+	rm -f $(TARGET)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
